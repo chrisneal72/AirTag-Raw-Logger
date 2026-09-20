@@ -22,7 +22,7 @@
 #include <WiFi.h>
 #include <time.h>
 #include <sys/time.h>
-#include "secrets.h"
+#include <secrets.h>
 
 #include <BLEDevice.h>
 #include <BLEUtils.h>
@@ -33,9 +33,9 @@
 // ============================================================
 // Wi-Fi configuration
 // ============================================================
-
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+// THIS IS NOW IN secrets.h  secrets.h is gitignored
+//const char* WIFI_SSID     = "YOUR_WIFI_SSID";
+//const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
 
 // ============================================================
@@ -387,8 +387,7 @@ void loop() {
 
   // Scan for one second.
 
-  BLEScanResults foundDevicesScan =
-      pBLEScan->start(scanTime, false);
+  pBLEScan->start(scanTime, false);
 
   // Release scan results.
 
