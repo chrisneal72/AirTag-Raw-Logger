@@ -22,6 +22,7 @@
 #include <WiFi.h>
 #include <time.h>
 #include <sys/time.h>
+#include "secrets.h"
 
 #include <BLEDevice.h>
 #include <BLEUtils.h>
