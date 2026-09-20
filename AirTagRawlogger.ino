@@ -1,55 +1,54 @@
-// AirTag Raw Logger V2
+// AirTag Raw Logger V3
 //
 // Based on:
 // Matthew KuKanich - ESP32-AirTag-Scanner
 // https://github.com/MatthewKuKanich/ESP32-AirTag-Scanner
 //
-// V2 changes:
-//   - Connects to Wi-Fi during startup
-//   - Synchronizes system clock using NTP
-//   - Uses Arizona local time for timestamps
-//   - Prints real date/time with every observation
-//   - Uses gettimeofday() for actual wall-clock milliseconds
-//   - Disconnects and turns off Wi-Fi after time synchronizationcpp
-//   - Logs EVERY matching AirTag advertisement
-//   - No application-level MAC deduplication
-//   - Still Serial output only
-//   - SD logging and scheduled sleep will be added later
+// V3 changes:
+//   - Keeps the V2 Wi-Fi/NTP Arizona local-time behavior.
+//   - Adds SD card CSV logging using SDMMC 1-bit mode.
+//   - Creates /AirTagLog/YYYY-MM-DD.csv for each local calendar day.
+//   - Writes the CSV header when a new daily file is created.
+//   - Logs every matching AirTag advertisement to Serial and SD.
+//   - Keeps duplicate BLE callbacks enabled.
+//   - Does not deduplicate by MAC address.
+//   - Does not add LittleFS fallback or scheduled sleep.
 //
-// ESP32-WROOM / ESP32-S3
+// Board:
+//   FREENOVE ESP32-S3-WROOM CAM
+//
+// SDMMC 1-bit pins on the FREENOVE board:
+//   CLK   = GPIO39
+//   CMD   = GPIO38
+//   DATA0 = GPIO40
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <time.h>
 #include <sys/time.h>
-#include <secrets.h>
+#include "secrets.h"
 
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 
+#include "FS.h"
+#include "SD_MMC.h"
 
 // ============================================================
-// Wi-Fi configuration
-// ============================================================
-// THIS IS NOW IN secrets.h  secrets.h is gitignored
-//const char* WIFI_SSID     = "YOUR_WIFI_SSID";
-//const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-
-
-// ============================================================
-// NTP / Time configuration
+// Wi-Fi / NTP configuration
 // ============================================================
 
-// Arizona local time is UTC-7.
-// Arizona does not observe daylight saving time.
+// WIFI_SSID and WIFI_PASSWORD are defined in secrets.h.
+// Keep secrets.h gitignored.
+
+// Arizona local time is UTC-7 and does not observe daylight saving time.
 const char* NTP_SERVER_1 = "pool.ntp.org";
 const char* NTP_SERVER_2 = "time.nist.gov";
 
 const long GMT_OFFSET_SEC = -7 * 3600;
 const int DAYLIGHT_OFFSET_SEC = 0;
-
 
 // ============================================================
 // BLE configuration
@@ -58,64 +57,79 @@ const int DAYLIGHT_OFFSET_SEC = 0;
 int scanTime = 1;
 
 BLEScan* pBLEScan;
-
 unsigned long observationCount = 0;
 
+// ============================================================
+// SD card configuration
+// ============================================================
+
+const int SD_CLK_PIN = 39;
+const int SD_CMD_PIN = 38;
+const int SD_DATA0_PIN = 40;
+
+const char* SD_MOUNT_POINT = "/sdcard";
+const char* SD_LOG_DIRECTORY = "/AirTagLog";
+const char* CSV_HEADER = "timestamp,mac,rssi,payload_length,payload";
+
+bool sdAvailable = false;
+bool timeSynchronized = false;
 
 // ============================================================
-// Print current system time
+// Timestamp helpers
 // ============================================================
 
-void printCurrentTime() {
+// Formats the current synchronized local time as:
+// YYYY-MM-DD HH:MM:SS.mmm
+bool getCurrentTimestamp(char* timestamp, size_t timestampSize) {
 
   struct timeval tv;
 
   if (gettimeofday(&tv, nullptr) != 0) {
-    Serial.println("ERROR: System time is not available.");
-    return;
+    return false;
   }
 
   struct tm timeinfo;
 
   if (!localtime_r(&tv.tv_sec, &timeinfo)) {
-    Serial.println("ERROR: Local time conversion failed.");
+    return false;
+  }
+
+  char dateTime[24];
+
+  if (strftime(
+        dateTime,
+        sizeof(dateTime),
+        "%Y-%m-%d %H:%M:%S",
+        &timeinfo) == 0) {
+    return false;
+  }
+
+  int milliseconds = static_cast<int>(tv.tv_usec / 1000);
+
+  int written = snprintf(
+      timestamp,
+      timestampSize,
+      "%s.%03d",
+      dateTime,
+      milliseconds);
+
+  return written > 0 && static_cast<size_t>(written) < timestampSize;
+}
+
+void printCurrentTime() {
+
+  char timestamp[32];
+
+  if (!getCurrentTimestamp(timestamp, sizeof(timestamp))) {
+    Serial.println("ERROR: System time is not available.");
     return;
   }
 
-  char timeString[32];
-
-  strftime(
-    timeString,
-    sizeof(timeString),
-    "%Y-%m-%d %H:%M:%S",
-    &timeinfo
-  );
-
-  Serial.print(timeString);
-
-  // tv_usec contains the actual microseconds from the
-  // synchronized system clock.
-  //
-  // We only display milliseconds.
-
-  int milliseconds = tv.tv_usec / 1000;
-
-  Serial.print(".");
-
-  if (milliseconds < 100) {
-    Serial.print("0");
-  }
-
-  if (milliseconds < 10) {
-    Serial.print("0");
-  }
-
-  Serial.print(milliseconds);
+  Serial.print(timestamp);
 }
 
-
 // ============================================================
-// Connect to Wi-Fi and synchronize time
+// Wi-Fi / NTP initialization
 // ============================================================
 
 bool initializeTime() {
@@ -160,11 +174,10 @@ bool initializeTime() {
   Serial.println("Synchronizing time with NTP...");
 
   configTime(
-    GMT_OFFSET_SEC,
-    DAYLIGHT_OFFSET_SEC,
-    NTP_SERVER_1,
-    NTP_SERVER_2
-  );
+      GMT_OFFSET_SEC,
+      DAYLIGHT_OFFSET_SEC,
+      NTP_SERVER_1,
+      NTP_SERVER_2);
 
   struct tm timeinfo;
 
@@ -183,7 +196,7 @@ bool initializeTime() {
   printCurrentTime();
   Serial.println();
 
-  // We don't need Wi-Fi during BLE scanning.
+  // Wi-Fi is not needed during BLE scanning.
   Serial.println("Disconnecting Wi-Fi...");
 
   WiFi.disconnect(true);
@@ -191,9 +204,167 @@ bool initializeTime() {
 
   Serial.println("Wi-Fi disabled.");
 
+  timeSynchronized = true;
+
   return true;
 }
 
+// ============================================================
+// SD card initialization and CSV helpers
+// ============================================================
+
+bool initializeSDCard() {
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("Initializing SD card");
+  Serial.println("========================================");
+
+  // FREENOVE ESP32-S3-WROOM CAM SDMMC pins.
+  // The onboard slot uses SDMMC 1-bit mode.
+  SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_DATA0_PIN);
+
+  if (!SD_MMC.begin(SD_MOUNT_POINT, true)) {
+
+    Serial.println("ERROR: SD card mount failed.");
+    Serial.println("SD logging will be disabled; Serial logging will continue.");
+
+    return false;
+  }
+
+  Serial.println("SD card mounted successfully.");
+
+  uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
+  uint64_t totalSpace = SD_MMC.totalBytes() / (1024 * 1024);
+  uint64_t usedSpace = SD_MMC.usedBytes() / (1024 * 1024);
+
+  Serial.print("Card size: ");
+  Serial.print(cardSize);
+  Serial.println(" MB");
+
+  Serial.print("Total filesystem space: ");
+  Serial.print(totalSpace);
+  Serial.println(" MB");
+
+  Serial.print("Used filesystem space: ");
+  Serial.print(usedSpace);
+  Serial.println(" MB");
+
+  if (!SD_MMC.exists(SD_LOG_DIRECTORY)) {
+
+    if (!SD_MMC.mkdir(SD_LOG_DIRECTORY)) {
+
+      Serial.println("ERROR: Could not create /AirTagLog directory.");
+      Serial.println("SD logging will be disabled; Serial logging will continue.");
+
+      return false;
+    }
+
+    Serial.println("Created /AirTagLog directory.");
+  }
+
+  Serial.println("SD logging ready.");
+
+  return true;
+}
+
+String makeDailyLogPath(const char* timestamp) {
+
+  // The timestamp begins with YYYY-MM-DD.
+  String path = SD_LOG_DIRECTORY;
+  path += "/";
+
+  for (size_t i = 0; i < 10; i++) {
+    path += timestamp[i];
+  }
+
+  path += ".csv";
+
+  return path;
+}
+
+bool createDailyLogFileIfNeeded(const String& path) {
+
+  if (SD_MMC.exists(path.c_str())) {
+    return true;
+  }
+
+  Serial.print("Creating daily log file: ");
+  Serial.println(path);
+
+  File file = SD_MMC.open(path.c_str(), FILE_WRITE);
+
+  if (!file) {
+
+    Serial.println("ERROR: Could not create daily CSV file.");
+    return false;
+  }
+
+  file.println(CSV_HEADER);
+  file.close();
+
+  return true;
+}
+
+void appendObservationToSD(
+    const char* timestamp,
+    const String& macAddress,
+    int rssi,
+    const uint8_t* payload,
+    size_t payloadLength) {
+
+  if (!sdAvailable) {
+    return;
+  }
+
+  // A valid timestamp is required for YYYY-MM-DD file rotation.
+  if (timestamp == nullptr || strlen(timestamp) < 10) {
+
+    Serial.println("SD log skipped: timestamp is unavailable.");
+    return;
+  }
+
+  String path = makeDailyLogPath(timestamp);
+
+  if (!createDailyLogFileIfNeeded(path)) {
+    return;
+  }
+
+  File file = SD_MMC.open(path.c_str(), FILE_APPEND);
+
+  if (!file) {
+
+    Serial.print("ERROR: Could not open CSV for append: ");
+    Serial.println(path);
+    return;
+  }
+
+  file.print(timestamp);
+  file.print(",");
+  file.print(macAddress);
+  file.print(",");
+  file.print(rssi);
+  file.print(",");
+  file.print(payloadLength);
+  file.print(",");
+
+  // Store the complete raw advertisement payload as uppercase hex bytes.
+  for (size_t i = 0; i < payloadLength; i++) {
+
+    if (payload[i] < 0x10) {
+      file.print("0");
+    }
+
+    file.print(payload[i], HEX);
+
+    if (i + 1 < payloadLength) {
+      file.print(" ");
+    }
+  }
+
+  file.println();
+  file.close();
+}
 
 // ============================================================
 // BLE advertisement callback
@@ -201,120 +372,128 @@ bool initializeTime() {
 
 class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
 
-    void onResult(BLEAdvertisedDevice advertisedDevice) {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
 
-      // Get raw advertisement payload
-      uint8_t* payLoad = advertisedDevice.getPayload();
-      size_t payLoadLength = advertisedDevice.getPayloadLength();
+    // Get the raw advertisement payload.
+    uint8_t* payLoad = advertisedDevice.getPayload();
+    size_t payLoadLength = advertisedDevice.getPayloadLength();
 
+    // --------------------------------------------------------
+    // Look for the same AirTag / Find My advertisement
+    // signatures used by the working V2 logger:
+    //
+    //   1E FF 4C 00
+    //   4C 00 12 19
+    // --------------------------------------------------------
 
-      // --------------------------------------------------------
-      // Look for AirTag / Find My advertisement signatures.
-      //
-      // Matthew's original scanner searches for:
-      //
-      //   1E FF 4C 00
-      //
-      // and:
-      //
-      //   4C 00 12 19
-      //
-      // --------------------------------------------------------
+    bool patternFound = false;
 
-      bool patternFound = false;
+    if (payLoadLength >= 4) {
 
-      if (payLoadLength >= 4) {
+      for (size_t i = 0; i <= payLoadLength - 4; i++) {
 
-        for (size_t i = 0; i <= payLoadLength - 4; i++) {
+        if (payLoad[i] == 0x1E &&
+            payLoad[i + 1] == 0xFF &&
+            payLoad[i + 2] == 0x4C &&
+            payLoad[i + 3] == 0x00) {
 
-          if (payLoad[i] == 0x1E &&
-              payLoad[i + 1] == 0xFF &&
-              payLoad[i + 2] == 0x4C &&
-              payLoad[i + 3] == 0x00) {
-
-            patternFound = true;
-            break;
-          }
-
-          if (payLoad[i] == 0x4C &&
-              payLoad[i + 1] == 0x00 &&
-              payLoad[i + 2] == 0x12 &&
-              payLoad[i + 3] == 0x19) {
-
-            patternFound = true;
-            break;
-          }
-        }
-      }
-
-
-      // Not an AirTag advertisement.
-      if (!patternFound) {
-        return;
-      }
-
-
-      // --------------------------------------------------------
-      // IMPORTANT:
-      //
-      // There is deliberately NO MAC deduplication here.
-      //
-      // Every matching advertisement received by the callback
-      // is recorded.
-      // --------------------------------------------------------
-
-      observationCount++;
-
-      String macAddress =
-          advertisedDevice.getAddress().toString().c_str();
-
-      macAddress.toUpperCase();
-
-      int rssi = advertisedDevice.getRSSI();
-
-
-      // --------------------------------------------------------
-      // Print observation
-      // --------------------------------------------------------
-
-      Serial.println();
-      Serial.println("========================================");
-
-      Serial.print("AirTag observation #");
-      Serial.println(observationCount);
-
-      Serial.print("Time:        ");
-      printCurrentTime();
-      Serial.println();
-
-      Serial.print("MAC Address: ");
-      Serial.println(macAddress);
-
-      Serial.print("RSSI:        ");
-      Serial.print(rssi);
-      Serial.println(" dBm");
-
-      Serial.print("Payload Len: ");
-      Serial.println(payLoadLength);
-
-      Serial.print("Payload:     ");
-
-      for (size_t i = 0; i < payLoadLength; i++) {
-
-        if (payLoad[i] < 0x10) {
-          Serial.print("0");
+          patternFound = true;
+          break;
         }
 
-        Serial.print(payLoad[i], HEX);
-        Serial.print(" ");
+        if (payLoad[i] == 0x4C &&
+            payLoad[i + 1] == 0x00 &&
+            payLoad[i + 2] == 0x12 &&
+            payLoad[i + 3] == 0x19) {
+
+          patternFound = true;
+          break;
+        }
       }
-
-      Serial.println();
-
-      Serial.println("========================================");
     }
-};
 
+    // Not an AirTag advertisement.
+    if (!patternFound) {
+      return;
+    }
+
+    // --------------------------------------------------------
+    // There is deliberately NO MAC deduplication here.
+    // Every matching advertisement received by the callback is
+    // recorded to Serial and, when available, to the SD card.
+    // --------------------------------------------------------
+
+    observationCount++;
+
+    String macAddress =
+        advertisedDevice.getAddress().toString().c_str();
+
+    macAddress.toUpperCase();
+
+    int rssi = advertisedDevice.getRSSI();
+
+    char timestamp[32];
+    bool timestampValid =
+        timeSynchronized &&
+        getCurrentTimestamp(timestamp, sizeof(timestamp));
+
+    // --------------------------------------------------------
+    // Keep the existing Serial observation output.
+    // --------------------------------------------------------
+
+    Serial.println();
+    Serial.println("========================================");
+
+    Serial.print("AirTag observation #");
+    Serial.println(observationCount);
+
+    Serial.print("Time:        ");
+
+    if (timestampValid) {
+      Serial.println(timestamp);
+    } else {
+      Serial.println("ERROR: System time is not available.");
+    }
+
+    Serial.print("MAC Address: ");
+    Serial.println(macAddress);
+
+    Serial.print("RSSI:        ");
+    Serial.print(rssi);
+    Serial.println(" dBm");
+
+    Serial.print("Payload Len: ");
+    Serial.println(payLoadLength);
+
+    Serial.print("Payload:     ");
+
+    for (size_t i = 0; i < payLoadLength; i++) {
+
+      if (payLoad[i] < 0x10) {
+        Serial.print("0");
+      }
+
+      Serial.print(payLoad[i], HEX);
+      Serial.print(" ");
+    }
+
+    Serial.println();
+
+    // Append the same complete observation to the daily CSV.
+    if (timestampValid) {
+      appendObservationToSD(
+          timestamp,
+          macAddress,
+          rssi,
+          payLoad,
+          payLoadLength);
+    } else {
+      Serial.println("SD log skipped: timestamp is unavailable.");
+    }
+
+    Serial.println("========================================");
+  }
+};
 
 // ============================================================
 // Setup
@@ -323,20 +502,16 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
 void setup() {
 
   Serial.begin(115200);
-
   delay(1000);
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println("AirTag Raw Logger V2");
+  Serial.println("AirTag Raw Logger V3");
   Serial.println("Arizona local time: UTC-7");
+  Serial.println("SD logging: /AirTagLog/YYYY-MM-DD.csv");
   Serial.println("========================================");
 
-
-  // ----------------------------------------------------------
   // Get accurate Arizona local date/time first.
-  // ----------------------------------------------------------
-
   bool timeValid = initializeTime();
 
   if (!timeValid) {
@@ -345,12 +520,15 @@ void setup() {
     Serial.println("WARNING:");
     Serial.println("System clock was not synchronized.");
     Serial.println("BLE scanning will continue.");
+    Serial.println("SD rows require a valid timestamp.");
     Serial.println();
   }
 
+  // Initialize the onboard FREENOVE SD card.
+  sdAvailable = initializeSDCard();
 
   // ----------------------------------------------------------
-  // Initialize BLE
+  // Initialize BLE.
   // ----------------------------------------------------------
 
   Serial.println("Initializing BLE...");
@@ -360,14 +538,12 @@ void setup() {
   pBLEScan = BLEDevice::getScan();
 
   // TRUE = request callbacks for duplicate advertisements.
-  //
   // This is important for our experiment.
   pBLEScan->setAdvertisedDeviceCallbacks(
       new MyAdvertisedDeviceCallbacks(),
-      true
-  );
+      true);
 
-  // Keep Matthew's original scan configuration.
+  // Keep the working V2 scan configuration.
   pBLEScan->setActiveScan(true);
   pBLEScan->setInterval(100);
   pBLEScan->setWindow(99);
@@ -378,7 +554,6 @@ void setup() {
   Serial.println();
 }
 
-
 // ============================================================
 // Main loop
 // ============================================================
@@ -386,11 +561,9 @@ void setup() {
 void loop() {
 
   // Scan for one second.
-
   pBLEScan->start(scanTime, false);
 
   // Release scan results.
-
   pBLEScan->clearResults();
 
   delay(50);
