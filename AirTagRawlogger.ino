@@ -13,6 +13,8 @@
 //   - Keeps duplicate BLE callbacks enabled.
 //   - Does not deduplicate by MAC address.
 //   - Does not add LittleFS fallback or scheduled sleep.
+//   - Test schedule: 10-second scan at each wall-clock minute mark.
+//   - Requests raw BLE payloads so duplicate callbacks do not accumulate data.
 //
 // Board:
 //   FREENOVE ESP32-S3-WROOM CAM
@@ -54,7 +56,11 @@ const int DAYLIGHT_OFFSET_SEC = 0;
 // BLE configuration
 // ============================================================
 
-int scanTime = 1;
+// Wall-clock schedule, not elapsed-time scheduling.
+//   1  = every minute at :00 during the test.
+//   30 = later, every half-hour at :00 and :30.
+const uint8_t CLOCK_MARK_MINUTES = 1;
+const uint32_t SCAN_DURATION_SECONDS = 10;
 
 BLEScan* pBLEScan;
 unsigned long observationCount = 0;
@@ -367,6 +373,64 @@ void appendObservationToSD(
 }
 
 // ============================================================
+// Wall-clock scheduling
+// ============================================================
+
+// Wait for the next wall-clock mark. With CLOCK_MARK_MINUTES = 1,
+// this means the next HH:MM:00. With CLOCK_MARK_MINUTES = 30,
+// it means the next HH:00:00 or HH:30:00.
+//
+// This is deliberately a normal delay for the current test. Later,
+// the same calculated wake time can be used for deep sleep.
+void waitUntilNextClockMark() {
+
+  if (!timeSynchronized) {
+
+    Serial.println("Clock unavailable; waiting 60 seconds without scheduling.");
+    delay(60000UL);
+    return;
+  }
+
+  struct timeval tv;
+
+  if (gettimeofday(&tv, nullptr) != 0) {
+
+    Serial.println("Clock read failed; retrying in one second.");
+    delay(1000);
+    return;
+  }
+
+  struct tm timeinfo;
+
+  if (!localtime_r(&tv.tv_sec, &timeinfo)) {
+
+    Serial.println("Local clock conversion failed; retrying in one second.");
+    delay(1000);
+    return;
+  }
+
+  uint32_t markLengthSeconds = CLOCK_MARK_MINUTES * 60UL;
+  uint32_t secondsIntoHour =
+      static_cast<uint32_t>(timeinfo.tm_min) * 60UL +
+      static_cast<uint32_t>(timeinfo.tm_sec);
+
+  // Always choose the next mark, even if we happen to be exactly on one.
+  uint32_t nextMarkSeconds =
+      ((secondsIntoHour / markLengthSeconds) + 1UL) * markLengthSeconds;
+
+  uint32_t secondsUntilMark = nextMarkSeconds - secondsIntoHour;
+  uint32_t millisecondsUntilMark =
+      secondsUntilMark * 1000UL -
+      static_cast<uint32_t>(tv.tv_usec / 1000);
+
+  Serial.print("Waiting for next clock mark in ");
+  Serial.print(millisecondsUntilMark / 1000UL);
+  Serial.println(" seconds...");
+
+  delay(millisecondsUntilMark);
+}
+
+// ============================================================
 // BLE advertisement callback
 // ============================================================
 
@@ -537,11 +601,15 @@ void setup() {
 
   pBLEScan = BLEDevice::getScan();
 
-  // TRUE = request callbacks for duplicate advertisements.
-  // This is important for our experiment.
+  // TRUE  = request callbacks for duplicate advertisements.
+  // FALSE = keep the raw payload intact and do not let the BLE
+  //         library parse/accumulate it across duplicate callbacks.
+  //
+  // We perform the AirTag signature matching ourselves below.
   pBLEScan->setAdvertisedDeviceCallbacks(
       new MyAdvertisedDeviceCallbacks(),
-      true);
+      true,
+      false);
 
   // Keep the working V2 scan configuration.
   pBLEScan->setActiveScan(true);
@@ -560,11 +628,16 @@ void setup() {
 
 void loop() {
 
-  // Scan for one second.
-  pBLEScan->start(scanTime, false);
+  // Start only on a wall-clock schedule mark.
+  waitUntilNextClockMark();
+
+  Serial.println("Starting 10-second BLE scan at the clock mark...");
+
+  // Scan for ten seconds.
+  pBLEScan->start(SCAN_DURATION_SECONDS, false);
 
   // Release scan results.
   pBLEScan->clearResults();
 
-  delay(50);
+  Serial.println("Scan complete. Waiting for the next clock mark...");
 }
