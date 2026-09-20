@@ -10,7 +10,7 @@
 //   - Uses Arizona local time for timestamps
 //   - Prints real date/time with every observation
 //   - Uses gettimeofday() for actual wall-clock milliseconds
-//   - Disconnects and turns off Wi-Fi after time synchronization
+//   - Disconnects and turns off Wi-Fi after time synchronizationcpp
 //   - Logs EVERY matching AirTag advertisement
 //   - No application-level MAC deduplication
 //   - Still Serial output only
