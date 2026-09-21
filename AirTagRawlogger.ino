@@ -514,6 +514,19 @@ void flushPendingLittleFS() {
   while (entry) {
 
     String pendingPath = entry.name();
+
+    // Some LittleFS implementations return only the entry name from
+    // openNextFile(), while others return the full path. Normalize both
+    // forms before opening the pending file.
+    if (!pendingPath.startsWith(LITTLEFS_PENDING_DIRECTORY)) {
+
+      if (!pendingPath.startsWith("/")) {
+        pendingPath = "/" + pendingPath;
+      }
+
+      pendingPath = String(LITTLEFS_PENDING_DIRECTORY) + pendingPath;
+    }
+
     bool isPendingCsv =
         !entry.isDirectory() && pendingPath.endsWith(".csv");
 
