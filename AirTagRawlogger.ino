@@ -1,10 +1,10 @@
-// AirTag Raw Logger V6
+// AirTag Raw Logger V7
 //
 // Based on:
 // Matthew KuKanich - ESP32-AirTag-Scanner
 // https://github.com/MatthewKuKanich/ESP32-AirTag-Scanner
 //
-// V6 changes:
+// V7 changes:
 //   - Keeps the V2 Wi-Fi/NTP Arizona local-time behavior.
 //   - Adds SD card CSV logging using SDMMC 1-bit mode.
 //   - Creates /AirTagLog/YYYY-MM-DD.csv for each local calendar day.
@@ -16,6 +16,9 @@
 //   - Does not deduplicate by MAC address.
 //   - Does not auto-format LittleFS.
 //   - Retries NTP synchronization before giving up.
+//   - Waits for a fresh SNTP synchronization callback instead of accepting
+//     a retained deep-sleep clock as newly synchronized.
+//   - Forces immediate NTP correction rather than gradual clock adjustment.
 //   - Production schedule: 30-second scan at every half-hour clock mark
 //     (:00 and :30).
 //   - Deep-sleeps between scheduled scans.
@@ -34,6 +37,7 @@
 #include <WiFi.h>
 #include <time.h>
 #include <sys/time.h>
+#include "esp_sntp.h"
 #include "secrets.h"
 
 #include <BLEDevice.h>
@@ -72,11 +76,19 @@ const uint8_t CLOCK_MARK_SECOND = 0;
 const uint32_t SCAN_DURATION_SECONDS = 30;
 
 const uint8_t NTP_SYNC_ATTEMPTS = 3;
-const uint32_t NTP_ATTEMPT_TIMEOUT_MS = 10000;
+const uint32_t NTP_ATTEMPT_TIMEOUT_MS = 15000;
 
 BLEScan* pBLEScan;
 unsigned long observationCount = 0;
 bool wakeFromTimer = false;
+volatile bool ntpSyncReceived = false;
+
+// This callback is invoked only when SNTP receives a fresh time update.
+// Do not print from the SNTP task; just set a flag for initializeTime().
+void onNtpTimeSync(struct timeval* tv) {
+  (void)tv;
+  ntpSyncReceived = true;
+}
 
 // ============================================================
 // SD card configuration
@@ -197,6 +209,12 @@ bool initializeTime() {
   struct tm timeinfo;
   bool ntpSynchronized = false;
 
+  // getLocalTime() only verifies that the stored year is plausible. After
+  // deep sleep, that can be an old but valid clock value. The callback below
+  // is the proof that a fresh NTP response was actually received.
+  esp_sntp_set_time_sync_notification_cb(onNtpTimeSync);
+  esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
+
   for (uint8_t attempt = 1;
        attempt <= NTP_SYNC_ATTEMPTS;
        attempt++) {
@@ -206,14 +224,24 @@ bool initializeTime() {
     Serial.print("/");
     Serial.println(NTP_SYNC_ATTEMPTS);
 
+    ntpSyncReceived = false;
+
     configTime(
         GMT_OFFSET_SEC,
         DAYLIGHT_OFFSET_SEC,
         NTP_SERVER_1,
         NTP_SERVER_2);
 
-    if (getLocalTime(&timeinfo, NTP_ATTEMPT_TIMEOUT_MS)) {
+    uint32_t waitStart = millis();
+
+    while (!ntpSyncReceived &&
+           (millis() - waitStart < NTP_ATTEMPT_TIMEOUT_MS)) {
+      delay(50);
+    }
+
+    if (ntpSyncReceived && getLocalTime(&timeinfo, 1000)) {
       ntpSynchronized = true;
+      Serial.println("Fresh NTP response received.");
       break;
     }
 
@@ -871,7 +899,7 @@ void setup() {
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println("AirTag Raw Logger V6");
+  Serial.println("AirTag Raw Logger V7");
   Serial.println("Arizona local time: UTC-7");
   Serial.println("SD logging: /AirTagLog/YYYY-MM-DD.csv");
   Serial.println("LittleFS fallback: /AirTagPending/YYYY-MM-DD.csv");
