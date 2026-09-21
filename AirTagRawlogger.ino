@@ -71,9 +71,9 @@ const int DAYLIGHT_OFFSET_SEC = 0;
 // Wall-clock schedule, not elapsed-time scheduling.
 //   Production schedule: CLOCK_MARK_MINUTES = 30,
 //   CLOCK_MARK_SECOND = 0, and 30-second scans.
-const uint8_t CLOCK_MARK_MINUTES = 30;
+const uint8_t CLOCK_MARK_MINUTES = 15;
 const uint8_t CLOCK_MARK_SECOND = 0;
-const uint32_t SCAN_DURATION_SECONDS = 30;
+const uint32_t SCAN_DURATION_SECONDS = 120;
 
 const uint8_t NTP_SYNC_ATTEMPTS = 3;
 const uint32_t NTP_ATTEMPT_TIMEOUT_MS = 15000;
