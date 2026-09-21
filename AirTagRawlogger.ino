@@ -1,10 +1,10 @@
-// AirTag Raw Logger V4
+// AirTag Raw Logger V6
 //
 // Based on:
 // Matthew KuKanich - ESP32-AirTag-Scanner
 // https://github.com/MatthewKuKanich/ESP32-AirTag-Scanner
 //
-// V4 changes:
+// V6 changes:
 //   - Keeps the V2 Wi-Fi/NTP Arizona local-time behavior.
 //   - Adds SD card CSV logging using SDMMC 1-bit mode.
 //   - Creates /AirTagLog/YYYY-MM-DD.csv for each local calendar day.
@@ -14,8 +14,12 @@
 //   - Replays pending LittleFS rows to SD on the next boot with SD present.
 //   - Keeps duplicate BLE callbacks enabled.
 //   - Does not deduplicate by MAC address.
-//   - Does not auto-format LittleFS or add scheduled deep sleep.
-//   - Test schedule: 10-second scan at each wall-clock minute mark.
+//   - Does not auto-format LittleFS.
+//   - Retries NTP synchronization before giving up.
+//   - Production schedule: 30-second scan at every half-hour clock mark
+//     (:00 and :30).
+//   - Deep-sleeps between scheduled scans.
+//   - Unmounts storage before sleep and remounts it after timer wake.
 //   - Requests raw BLE payloads so duplicate callbacks do not accumulate data.
 //
 // Board:
@@ -40,6 +44,7 @@
 #include "FS.h"
 #include "SD_MMC.h"
 #include "LittleFS.h"
+#include "esp_sleep.h"
 
 // ============================================================
 // Wi-Fi / NTP configuration
@@ -60,13 +65,18 @@ const int DAYLIGHT_OFFSET_SEC = 0;
 // ============================================================
 
 // Wall-clock schedule, not elapsed-time scheduling.
-//   1  = every minute at :00 during the test.
-//   30 = later, every half-hour at :00 and :30.
-const uint8_t CLOCK_MARK_MINUTES = 1;
-const uint32_t SCAN_DURATION_SECONDS = 10;
+//   Production schedule: CLOCK_MARK_MINUTES = 30,
+//   CLOCK_MARK_SECOND = 0, and 30-second scans.
+const uint8_t CLOCK_MARK_MINUTES = 30;
+const uint8_t CLOCK_MARK_SECOND = 0;
+const uint32_t SCAN_DURATION_SECONDS = 30;
+
+const uint8_t NTP_SYNC_ATTEMPTS = 3;
+const uint32_t NTP_ATTEMPT_TIMEOUT_MS = 10000;
 
 BLEScan* pBLEScan;
 unsigned long observationCount = 0;
+bool wakeFromTimer = false;
 
 // ============================================================
 // SD card configuration
@@ -184,18 +194,39 @@ bool initializeTime() {
 
   Serial.println("Synchronizing time with NTP...");
 
-  configTime(
-      GMT_OFFSET_SEC,
-      DAYLIGHT_OFFSET_SEC,
-      NTP_SERVER_1,
-      NTP_SERVER_2);
-
   struct tm timeinfo;
+  bool ntpSynchronized = false;
 
-  // Give NTP up to 15 seconds.
-  if (!getLocalTime(&timeinfo, 15000)) {
+  for (uint8_t attempt = 1;
+       attempt <= NTP_SYNC_ATTEMPTS;
+       attempt++) {
 
-    Serial.println("NTP synchronization failed.");
+    Serial.print("NTP attempt ");
+    Serial.print(attempt);
+    Serial.print("/");
+    Serial.println(NTP_SYNC_ATTEMPTS);
+
+    configTime(
+        GMT_OFFSET_SEC,
+        DAYLIGHT_OFFSET_SEC,
+        NTP_SERVER_1,
+        NTP_SERVER_2);
+
+    if (getLocalTime(&timeinfo, NTP_ATTEMPT_TIMEOUT_MS)) {
+      ntpSynchronized = true;
+      break;
+    }
+
+    Serial.println("NTP attempt failed.");
+
+    if (attempt < NTP_SYNC_ATTEMPTS) {
+      delay(1000);
+    }
+  }
+
+  if (!ntpSynchronized) {
+
+    Serial.println("NTP synchronization failed after all retries.");
 
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
@@ -330,9 +361,10 @@ bool appendCsvRecord(
   }
 
   file.print(record);
+  bool writeSucceeded = file.getWriteError() == 0;
   file.close();
 
-  return true;
+  return writeSucceeded;
 }
 
 String buildCsvRecord(
@@ -579,6 +611,7 @@ void logObservationToStorage(
     }
 
     Serial.println("WARNING: SD append failed; switching to LittleFS fallback.");
+    SD_MMC.end();
     sdAvailable = false;
   }
 
@@ -605,18 +638,34 @@ void logObservationToStorage(
 // Wall-clock scheduling
 // ============================================================
 
-// Wait for the next wall-clock mark. With CLOCK_MARK_MINUTES = 1,
-// this means the next HH:MM:00. With CLOCK_MARK_MINUTES = 30,
-// it means the next HH:00:00 or HH:30:00.
-//
-// This is deliberately a normal delay for the current test. Later,
-// the same calculated wake time can be used for deep sleep.
-void waitUntilNextClockMark() {
+void unmountStorageBeforeSleep() {
+
+  // All observation files are closed immediately after each write.
+  // Explicitly end both filesystems before deep sleep anyway.
+  if (sdAvailable) {
+    Serial.println("Unmounting SD card...");
+    SD_MMC.end();
+    sdAvailable = false;
+  }
+
+  if (littleFsAvailable) {
+    Serial.println("Unmounting LittleFS...");
+    LittleFS.end();
+    littleFsAvailable = false;
+  }
+}
+
+// Put the ESP32 into deep sleep until the next wall-clock mark.
+// With CLOCK_MARK_MINUTES = 30 and CLOCK_MARK_SECOND = 0,
+// this means the next HH:00:00 or HH:30:00.
+void deepSleepUntilNextClockMark() {
 
   if (!timeSynchronized) {
 
-    Serial.println("Clock unavailable; waiting 60 seconds without scheduling.");
-    delay(60000UL);
+    Serial.println("Clock unavailable; rebooting in 30 seconds to retry NTP.");
+    Serial.flush();
+    delay(30000UL);
+    ESP.restart();
     return;
   }
 
@@ -624,8 +673,10 @@ void waitUntilNextClockMark() {
 
   if (gettimeofday(&tv, nullptr) != 0) {
 
-    Serial.println("Clock read failed; retrying in one second.");
+    Serial.println("Clock read failed; rebooting to retry NTP.");
+    Serial.flush();
     delay(1000);
+    ESP.restart();
     return;
   }
 
@@ -633,8 +684,10 @@ void waitUntilNextClockMark() {
 
   if (!localtime_r(&tv.tv_sec, &timeinfo)) {
 
-    Serial.println("Local clock conversion failed; retrying in one second.");
+    Serial.println("Local clock conversion failed; rebooting to retry NTP.");
+    Serial.flush();
     delay(1000);
+    ESP.restart();
     return;
   }
 
@@ -643,20 +696,35 @@ void waitUntilNextClockMark() {
       static_cast<uint32_t>(timeinfo.tm_min) * 60UL +
       static_cast<uint32_t>(timeinfo.tm_sec);
 
-  // Always choose the next mark, even if we happen to be exactly on one.
+  uint32_t currentMarkBlock =
+      (secondsIntoHour / markLengthSeconds) * markLengthSeconds;
+
   uint32_t nextMarkSeconds =
-      ((secondsIntoHour / markLengthSeconds) + 1UL) * markLengthSeconds;
+      currentMarkBlock + CLOCK_MARK_SECOND;
+
+  // Always choose a future mark. Timer wakeups bypass this function and
+  // begin scanning immediately after startup initialization.
+  if (nextMarkSeconds <= secondsIntoHour) {
+    nextMarkSeconds += markLengthSeconds;
+  }
 
   uint32_t secondsUntilMark = nextMarkSeconds - secondsIntoHour;
-  uint32_t millisecondsUntilMark =
-      secondsUntilMark * 1000UL -
-      static_cast<uint32_t>(tv.tv_usec / 1000);
+  uint64_t microsecondsUntilMark =
+      static_cast<uint64_t>(secondsUntilMark) * 1000000ULL -
+      static_cast<uint64_t>(tv.tv_usec);
 
-  Serial.print("Waiting for next clock mark in ");
-  Serial.print(millisecondsUntilMark / 1000UL);
+  Serial.print("Deep sleeping until next clock mark in ");
+  Serial.print(
+      static_cast<unsigned long>(microsecondsUntilMark / 1000000ULL));
   Serial.println(" seconds...");
 
-  delay(millisecondsUntilMark);
+  unmountStorageBeforeSleep();
+
+  esp_sleep_enable_timer_wakeup(microsecondsUntilMark);
+
+  Serial.flush();
+  delay(50);
+  esp_deep_sleep_start();
 }
 
 // ============================================================
@@ -798,13 +866,21 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  wakeFromTimer =
+      esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
+
   Serial.println();
   Serial.println("========================================");
-  Serial.println("AirTag Raw Logger V4");
+  Serial.println("AirTag Raw Logger V6");
   Serial.println("Arizona local time: UTC-7");
   Serial.println("SD logging: /AirTagLog/YYYY-MM-DD.csv");
   Serial.println("LittleFS fallback: /AirTagPending/YYYY-MM-DD.csv");
+  Serial.println("Schedule: every 30 minutes at :00/:30, 30-second scan");
   Serial.println("========================================");
+
+  if (wakeFromTimer) {
+    Serial.println("Wake reason: deep-sleep timer");
+  }
 
   // Get accurate Arizona local date/time first.
   bool timeValid = initializeTime();
@@ -814,7 +890,7 @@ void setup() {
     Serial.println();
     Serial.println("WARNING:");
     Serial.println("System clock was not synchronized.");
-    Serial.println("BLE scanning will continue.");
+    Serial.println("BLE scanning will wait for a valid clock.");
     Serial.println("SD rows require a valid timestamp.");
     Serial.println();
   }
@@ -857,7 +933,7 @@ void setup() {
 
   Serial.println("BLE initialized.");
   Serial.println();
-  Serial.println("Scanning for AirTags...");
+  Serial.println("Waiting for scheduled scan...");
   Serial.println();
 }
 
@@ -867,10 +943,21 @@ void setup() {
 
 void loop() {
 
-  // Start only on a wall-clock schedule mark.
-  waitUntilNextClockMark();
+  if (wakeFromTimer) {
 
-  Serial.println("Starting 10-second BLE scan at the clock mark...");
+    // A timer wake corresponds to the scheduled mark. Startup work such as
+    // NTP synchronization may have taken a few seconds, so scan immediately
+    // instead of waiting for the next mark and skipping this cycle.
+    wakeFromTimer = false;
+    Serial.println("Timer wake complete; starting scheduled scan now.");
+
+  } else {
+
+    // Initial power-on: sleep until the first wall-clock mark.
+    deepSleepUntilNextClockMark();
+  }
+
+  Serial.println("Starting 30-second BLE scan at the clock mark...");
 
   // Scan for ten seconds.
   pBLEScan->start(SCAN_DURATION_SECONDS, false);
@@ -878,5 +965,8 @@ void loop() {
   // Release scan results.
   pBLEScan->clearResults();
 
-  Serial.println("Scan complete. Waiting for the next clock mark...");
+  Serial.println("Scan complete.");
+
+  // Close storage and deep sleep until the next wall-clock mark.
+  deepSleepUntilNextClockMark();
 }
