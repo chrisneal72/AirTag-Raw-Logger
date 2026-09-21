@@ -1,18 +1,20 @@
-// AirTag Raw Logger V3
+// AirTag Raw Logger V4
 //
 // Based on:
 // Matthew KuKanich - ESP32-AirTag-Scanner
 // https://github.com/MatthewKuKanich/ESP32-AirTag-Scanner
 //
-// V3 changes:
+// V4 changes:
 //   - Keeps the V2 Wi-Fi/NTP Arizona local-time behavior.
 //   - Adds SD card CSV logging using SDMMC 1-bit mode.
 //   - Creates /AirTagLog/YYYY-MM-DD.csv for each local calendar day.
 //   - Writes the CSV header when a new daily file is created.
 //   - Logs every matching AirTag advertisement to Serial and SD.
+//   - Falls back to LittleFS pending CSV files when SD is unavailable.
+//   - Replays pending LittleFS rows to SD on the next boot with SD present.
 //   - Keeps duplicate BLE callbacks enabled.
 //   - Does not deduplicate by MAC address.
-//   - Does not add LittleFS fallback or scheduled sleep.
+//   - Does not auto-format LittleFS or add scheduled deep sleep.
 //   - Test schedule: 10-second scan at each wall-clock minute mark.
 //   - Requests raw BLE payloads so duplicate callbacks do not accumulate data.
 //
@@ -37,6 +39,7 @@
 
 #include "FS.h"
 #include "SD_MMC.h"
+#include "LittleFS.h"
 
 // ============================================================
 // Wi-Fi / NTP configuration
@@ -75,9 +78,11 @@ const int SD_DATA0_PIN = 40;
 
 const char* SD_MOUNT_POINT = "/sdcard";
 const char* SD_LOG_DIRECTORY = "/AirTagLog";
+const char* LITTLEFS_PENDING_DIRECTORY = "/AirTagPending";
 const char* CSV_HEADER = "timestamp,mac,rssi,payload_length,payload";
 
 bool sdAvailable = false;
+bool littleFsAvailable = false;
 bool timeSynchronized = false;
 
 // ============================================================
@@ -274,10 +279,12 @@ bool initializeSDCard() {
   return true;
 }
 
-String makeDailyLogPath(const char* timestamp) {
+String makeDailyFilePath(
+    const char* directory,
+    const char* timestamp) {
 
   // The timestamp begins with YYYY-MM-DD.
-  String path = SD_LOG_DIRECTORY;
+  String path = directory;
   path += "/";
 
   for (size_t i = 0; i < 10; i++) {
@@ -289,20 +296,15 @@ String makeDailyLogPath(const char* timestamp) {
   return path;
 }
 
-bool createDailyLogFileIfNeeded(const String& path) {
+bool ensureCsvFile(fs::FS& filesystem, const String& path) {
 
-  if (SD_MMC.exists(path.c_str())) {
+  if (filesystem.exists(path.c_str())) {
     return true;
   }
 
-  Serial.print("Creating daily log file: ");
-  Serial.println(path);
-
-  File file = SD_MMC.open(path.c_str(), FILE_WRITE);
+  File file = filesystem.open(path.c_str(), FILE_WRITE);
 
   if (!file) {
-
-    Serial.println("ERROR: Could not create daily CSV file.");
     return false;
   }
 
@@ -312,64 +314,278 @@ bool createDailyLogFileIfNeeded(const String& path) {
   return true;
 }
 
-void appendObservationToSD(
+bool appendCsvRecord(
+    fs::FS& filesystem,
+    const String& path,
+    const String& record) {
+
+  if (!ensureCsvFile(filesystem, path)) {
+    return false;
+  }
+
+  File file = filesystem.open(path.c_str(), FILE_APPEND);
+
+  if (!file) {
+    return false;
+  }
+
+  file.print(record);
+  file.close();
+
+  return true;
+}
+
+String buildCsvRecord(
     const char* timestamp,
     const String& macAddress,
     int rssi,
     const uint8_t* payload,
     size_t payloadLength) {
 
-  if (!sdAvailable) {
-    return;
-  }
+  String record;
+  record.reserve(64 + macAddress.length() + payloadLength * 3);
 
-  // A valid timestamp is required for YYYY-MM-DD file rotation.
-  if (timestamp == nullptr || strlen(timestamp) < 10) {
-
-    Serial.println("SD log skipped: timestamp is unavailable.");
-    return;
-  }
-
-  String path = makeDailyLogPath(timestamp);
-
-  if (!createDailyLogFileIfNeeded(path)) {
-    return;
-  }
-
-  File file = SD_MMC.open(path.c_str(), FILE_APPEND);
-
-  if (!file) {
-
-    Serial.print("ERROR: Could not open CSV for append: ");
-    Serial.println(path);
-    return;
-  }
-
-  file.print(timestamp);
-  file.print(",");
-  file.print(macAddress);
-  file.print(",");
-  file.print(rssi);
-  file.print(",");
-  file.print(payloadLength);
-  file.print(",");
+  record += timestamp;
+  record += ",";
+  record += macAddress;
+  record += ",";
+  record += String(rssi);
+  record += ",";
+  record += String(payloadLength);
+  record += ",";
 
   // Store the complete raw advertisement payload as uppercase hex bytes.
   for (size_t i = 0; i < payloadLength; i++) {
 
-    if (payload[i] < 0x10) {
-      file.print("0");
-    }
-
-    file.print(payload[i], HEX);
+    char byteHex[3];
+    snprintf(byteHex, sizeof(byteHex), "%02X", payload[i]);
+    record += byteHex;
 
     if (i + 1 < payloadLength) {
-      file.print(" ");
+      record += " ";
     }
   }
 
-  file.println();
-  file.close();
+  record += "\n";
+
+  return record;
+}
+
+bool initializeLittleFS() {
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("Initializing LittleFS fallback");
+  Serial.println("========================================");
+
+  // Do not auto-format the filesystem in the main logger.
+  if (!LittleFS.begin(false)) {
+
+    Serial.println("ERROR: LittleFS mount failed.");
+    Serial.println("LittleFS fallback will be disabled.");
+
+    return false;
+  }
+
+  Serial.println("LittleFS mounted successfully.");
+
+  Serial.print("Total LittleFS space: ");
+  Serial.print(LittleFS.totalBytes());
+  Serial.println(" bytes");
+
+  Serial.print("Used LittleFS space: ");
+  Serial.print(LittleFS.usedBytes());
+  Serial.println(" bytes");
+
+  if (!LittleFS.exists(LITTLEFS_PENDING_DIRECTORY)) {
+
+    if (!LittleFS.mkdir(LITTLEFS_PENDING_DIRECTORY)) {
+
+      Serial.println("ERROR: Could not create LittleFS pending directory.");
+      Serial.println("LittleFS fallback will be disabled.");
+
+      LittleFS.end();
+      return false;
+    }
+  }
+
+  Serial.println("LittleFS fallback ready.");
+
+  return true;
+}
+
+bool flushPendingFileToSD(const String& pendingPath) {
+
+  if (!sdAvailable || !littleFsAvailable) {
+    return false;
+  }
+
+  int lastSlash = pendingPath.lastIndexOf('/');
+
+  if (lastSlash < 0) {
+    return false;
+  }
+
+  String fileName = pendingPath.substring(lastSlash + 1);
+  String sdPath = String(SD_LOG_DIRECTORY) + "/" + fileName;
+
+  if (!ensureCsvFile(SD_MMC, sdPath)) {
+
+    Serial.print("ERROR: Could not prepare SD file for pending data: ");
+    Serial.println(sdPath);
+    return false;
+  }
+
+  File pendingFile = LittleFS.open(pendingPath.c_str(), FILE_READ);
+  File sdFile = SD_MMC.open(sdPath.c_str(), FILE_APPEND);
+
+  if (!pendingFile || !sdFile) {
+
+    if (pendingFile) {
+      pendingFile.close();
+    }
+
+    if (sdFile) {
+      sdFile.close();
+    }
+
+    return false;
+  }
+
+  // Pending files have the same header as the SD CSV. Skip that first line
+  // while replaying the data rows.
+  bool firstLine = true;
+  while (pendingFile.available()) {
+
+    String line = pendingFile.readStringUntil('\n');
+
+    if (firstLine) {
+      firstLine = false;
+      continue;
+    }
+
+    if (line.endsWith("\r")) {
+      line.remove(line.length() - 1);
+    }
+
+    if (line.length() == 0) {
+      continue;
+    }
+
+    sdFile.print(line);
+    sdFile.print("\n");
+  }
+
+  bool replaySucceeded = sdFile.getWriteError() == 0;
+
+  pendingFile.close();
+  sdFile.close();
+
+  if (!replaySucceeded) {
+    return false;
+  }
+
+  if (!LittleFS.remove(pendingPath.c_str())) {
+
+    Serial.print("ERROR: Could not remove replayed pending file: ");
+    Serial.println(pendingPath);
+    return false;
+  }
+
+  return true;
+}
+
+void flushPendingLittleFS() {
+
+  if (!sdAvailable || !littleFsAvailable) {
+    return;
+  }
+
+  File pendingDirectory = LittleFS.open(LITTLEFS_PENDING_DIRECTORY);
+
+  if (!pendingDirectory || !pendingDirectory.isDirectory()) {
+
+    Serial.println("ERROR: Could not open LittleFS pending directory.");
+    return;
+  }
+
+  File entry = pendingDirectory.openNextFile();
+
+  while (entry) {
+
+    String pendingPath = entry.name();
+    bool isPendingCsv =
+        !entry.isDirectory() && pendingPath.endsWith(".csv");
+
+    entry.close();
+
+    if (isPendingCsv) {
+
+      Serial.print("Replaying LittleFS pending file: ");
+      Serial.println(pendingPath);
+
+      if (flushPendingFileToSD(pendingPath)) {
+        Serial.println("Pending file replayed and removed successfully.");
+      } else {
+        Serial.println("Pending file replay failed; keeping it on LittleFS.");
+      }
+    }
+
+    entry = pendingDirectory.openNextFile();
+  }
+
+  pendingDirectory.close();
+}
+
+void logObservationToStorage(
+    const char* timestamp,
+    const String& macAddress,
+    int rssi,
+    const uint8_t* payload,
+    size_t payloadLength) {
+
+  if (timestamp == nullptr || strlen(timestamp) < 10) {
+
+    Serial.println("Storage log skipped: timestamp is unavailable.");
+    return;
+  }
+
+  String record = buildCsvRecord(
+      timestamp,
+      macAddress,
+      rssi,
+      payload,
+      payloadLength);
+
+  if (sdAvailable) {
+
+    String sdPath = makeDailyFilePath(SD_LOG_DIRECTORY, timestamp);
+
+    if (appendCsvRecord(SD_MMC, sdPath, record)) {
+      return;
+    }
+
+    Serial.println("WARNING: SD append failed; switching to LittleFS fallback.");
+    sdAvailable = false;
+  }
+
+  if (littleFsAvailable) {
+
+    String pendingPath = makeDailyFilePath(
+        LITTLEFS_PENDING_DIRECTORY,
+        timestamp);
+
+    if (appendCsvRecord(LittleFS, pendingPath, record)) {
+      Serial.print("Stored observation in LittleFS pending file: ");
+      Serial.println(pendingPath);
+      return;
+    }
+
+    Serial.println("ERROR: LittleFS fallback append failed.");
+    return;
+  }
+
+  Serial.println("ERROR: Neither SD nor LittleFS is available for this row.");
 }
 
 // ============================================================
@@ -543,9 +759,10 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
 
     Serial.println();
 
-    // Append the same complete observation to the daily CSV.
+    // Store the same complete observation. SD is primary; LittleFS is the
+    // pending fallback when SD is unavailable.
     if (timestampValid) {
-      appendObservationToSD(
+      logObservationToStorage(
           timestamp,
           macAddress,
           rssi,
@@ -570,9 +787,10 @@ void setup() {
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println("AirTag Raw Logger V3");
+  Serial.println("AirTag Raw Logger V4");
   Serial.println("Arizona local time: UTC-7");
   Serial.println("SD logging: /AirTagLog/YYYY-MM-DD.csv");
+  Serial.println("LittleFS fallback: /AirTagPending/YYYY-MM-DD.csv");
   Serial.println("========================================");
 
   // Get accurate Arizona local date/time first.
@@ -590,6 +808,14 @@ void setup() {
 
   // Initialize the onboard FREENOVE SD card.
   sdAvailable = initializeSDCard();
+
+  // Initialize internal flash fallback without auto-formatting.
+  littleFsAvailable = initializeLittleFS();
+
+  // If SD is available again after a previous outage, replay pending rows.
+  if (sdAvailable && littleFsAvailable) {
+    flushPendingLittleFS();
+  }
 
   // ----------------------------------------------------------
   // Initialize BLE.
