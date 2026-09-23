@@ -1,10 +1,10 @@
-// AirTag Raw Logger V7
+// AirTag Raw Logger V8
 //
 // Based on:
 // Matthew KuKanich - ESP32-AirTag-Scanner
 // https://github.com/MatthewKuKanich/ESP32-AirTag-Scanner
 //
-// V7 changes:
+// V8 changes:
 //   - Keeps the V2 Wi-Fi/NTP Arizona local-time behavior.
 //   - Adds SD card CSV logging using SDMMC 1-bit mode.
 //   - Creates /AirTagLog/YYYY-MM-DD.csv for each local calendar day.
@@ -19,8 +19,8 @@
 //   - Waits for a fresh SNTP synchronization callback instead of accepting
 //     a retained deep-sleep clock as newly synchronized.
 //   - Forces immediate NTP correction rather than gradual clock adjustment.
-//   - Production schedule: 30-second scan at every half-hour clock mark
-//     (:00 and :30).
+//   - Production schedule: 120-second scan at every 15-minute clock mark
+//     (:00, :15, :30, and :45).
 //   - Deep-sleeps between scheduled scans.
 //   - Unmounts storage before sleep and remounts it after timer wake.
 //   - Requests raw BLE payloads so duplicate callbacks do not accumulate data.
@@ -69,8 +69,8 @@ const int DAYLIGHT_OFFSET_SEC = 0;
 // ============================================================
 
 // Wall-clock schedule, not elapsed-time scheduling.
-//   Production schedule: CLOCK_MARK_MINUTES = 30,
-//   CLOCK_MARK_SECOND = 0, and 30-second scans.
+//   Production schedule: CLOCK_MARK_MINUTES = 15,
+//   CLOCK_MARK_SECOND = 0, and 120-second scans.
 const uint8_t CLOCK_MARK_MINUTES = 15;
 const uint8_t CLOCK_MARK_SECOND = 0;
 const uint32_t SCAN_DURATION_SECONDS = 120;
@@ -684,8 +684,8 @@ void unmountStorageBeforeSleep() {
 }
 
 // Put the ESP32 into deep sleep until the next wall-clock mark.
-// With CLOCK_MARK_MINUTES = 30 and CLOCK_MARK_SECOND = 0,
-// this means the next HH:00:00 or HH:30:00.
+// With CLOCK_MARK_MINUTES = 15 and CLOCK_MARK_SECOND = 0,
+// this means the next HH:00:00, HH:15:00, HH:30:00, or HH:45:00.
 void deepSleepUntilNextClockMark() {
 
   if (!timeSynchronized) {
@@ -899,11 +899,11 @@ void setup() {
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println("AirTag Raw Logger V7");
+  Serial.println("AirTag Raw Logger V8");
   Serial.println("Arizona local time: UTC-7");
   Serial.println("SD logging: /AirTagLog/YYYY-MM-DD.csv");
   Serial.println("LittleFS fallback: /AirTagPending/YYYY-MM-DD.csv");
-  Serial.println("Schedule: every 30 minutes at :00/:30, 30-second scan");
+  Serial.println("Schedule: every 15 minutes at :00/:15/:30/:45, 120-second scan");
   Serial.println("========================================");
 
   if (wakeFromTimer) {
@@ -985,7 +985,7 @@ void loop() {
     deepSleepUntilNextClockMark();
   }
 
-  Serial.println("Starting 30-second BLE scan at the clock mark...");
+  Serial.println("Starting 120-second BLE scan at the clock mark...");
 
   // Scan for ten seconds.
   pBLEScan->start(SCAN_DURATION_SECONDS, false);
