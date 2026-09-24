@@ -86,7 +86,15 @@ volatile bool ntpSyncReceived = false;
 // This callback is invoked only when SNTP receives a fresh time update.
 // Do not print from the SNTP task; just set a flag for initializeTime().
 void onNtpTimeSync(struct timeval* tv) {
-  (void)tv;
+  if (tv != nullptr) {
+    Serial.print("SNTP callback epoch: ");
+    Serial.print(tv->tv_sec);
+    Serial.print(".");
+    Serial.println(tv->tv_usec);
+  } else {
+    Serial.println("SNTP callback received with NULL timeval.");
+  }
+
   ntpSyncReceived = true;
 }
 
@@ -242,6 +250,19 @@ bool initializeTime() {
     if (ntpSyncReceived && getLocalTime(&timeinfo, 1000)) {
       ntpSynchronized = true;
       Serial.println("Fresh NTP response received.");
+
+      // Immediately read the ESP system clock after the SNTP update.
+      struct timeval now;
+
+      if (gettimeofday(&now, nullptr) == 0) {
+        Serial.print("System clock epoch: ");
+        Serial.print(now.tv_sec);
+        Serial.print(".");
+        Serial.println(now.tv_usec);
+      } else {
+        Serial.println("ERROR: Could not read system clock.");
+      }
+
       break;
     }
 
